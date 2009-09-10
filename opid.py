@@ -138,9 +138,10 @@ def default_post_app(environ, start_response):
 
 
 def default_session_context_manager(session_key):
-    """The session context manager pulls a session out of an environment
-    using a key. This default implementation assumes a Beaker based
-    session."""
+    """The session context manager pulls a session out of an
+    environment using a key. This default implementation assumes a
+    Beaker-like session, ie one that requires calls to save() to make
+    permanent changes to sessions.."""
 
     class context_manager(object):
         def __init__(self, environ):
