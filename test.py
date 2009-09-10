@@ -51,16 +51,14 @@ def logged_out_app(environ, start_response):
 
 
 opid_session_key = 'test.session'
-opid_app = opid.App(session_key=opid_session_key,
-                    #store=opid.FileStore('opid.store')
-                    )
-session_app = lambda app: beaker.middleware.SessionMiddleware(app, environ_key=opid_session_key)
+opid_app = opid.App(session_key=opid_session_key)
 
 urls = paste.urlmap.URLMap()
-urls['/'] = session_app(index_app)
-urls['/opid'] = session_app(opid_app)
-urls['/signout'] = session_app(opid_app.unauth_app('/logged_out'))
-urls['/failure'] = session_app(failure_app)
-urls['/logged_out'] = session_app(logged_out_app)
+urls['/'] = index_app
+urls['/opid'] = opid_app
+urls['/signout'] = opid_app.unauth_app('/logged_out')
+urls['/failure'] = failure_app
+urls['/logged_out'] = logged_out_app
+urls = beaker.middleware.SessionMiddleware(urls, environ_key=opid_session_key)
 
 paste.httpserver.serve(urls)

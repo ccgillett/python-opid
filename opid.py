@@ -38,6 +38,7 @@ Chow <wes.chow@s7labs.com>. You can use it to add OpenID login support
 to your WSGI application.
 """
 
+from __future__ import with_statement
 
 import time
 import urlparse
@@ -136,31 +137,59 @@ def default_post_app(environ, start_response):
     return [content]
 
 
-def _get_session(environ, key):
-    """Default session retrieval. Opid currently does not allow you to use
-    anything beside Beaker, however its design allows for other
-    session middleware."""
+def default_session_context_manager(session_key):
+    """The session context manager pulls a session out of an environment
+    using a key. This default implementation assumes a Beaker based
+    session."""
 
-    # fixme: it'd be nicer to use context manager:
-    # http://python.org/doc/2.5.2/lib/typecontextmanager.html
+    class context_manager(object):
+        def __init__(self, environ):
+            try:
+                self.session = environ[session_key]
+            except KeyError, e:
+                raise OpidException("No session '%s' -- session middleware probably unconfigured" % key)
 
-    try:
-        return environ[key]
-    except KeyError, e:
-        raise OpidException("No session '%s' -- session middleware probably unconfigured" % key)
+        def __enter__(self):
+            return self.session
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is None:
+                # no problems -- save session
+                self.session.save()
+            return False
+
+    return context_manager
 
 
 class App(object):
     """Opid WSGI app."""
 
-    def __init__(self, realm=None, session_key='beaker.session',
+    def __init__(self, realm=None,
+                 session_key=None, session_context=None,
                  store=None,
                  redirect_app=default_redirect_app, post_app=default_post_app):
-        """Sets up an OpenID authentication app on /verify and /return. If no
-        realm is given, it defaults to the HTTP host, found from the
-        WSGI environment. If no store is specified, defaults to a
-        memory based store. Otherwise, it expects you to supply the
-        required store.
+        """Sets up an OpenID authentication app on /verify and
+        /return, relative to Opid's dispatch path. For example, if you
+        install Opid at path X, it expects to take control of X/verify
+        and X/return. You can optionally install an unauthentication
+        path by adding the WSGI app returned from unauth_app() into
+        your set of routes, or you can manually call unauth()
+        elsewhere in your application.
+
+        If no realm is given, it defaults to the HTTP host, found from
+        the WSGI environment.
+
+        If you supply a session_key, it defaults to using Beaker-like
+        sessions (ie, a session implementation that requires calling
+        save() to make permanent changes). If you supply a
+        session_context, it will that context manager instead. Opid
+        acquires a context by calling session_context(environ). It is
+        a ValueError to supply both session_key and session_context.
+
+        Opid defaults to using a memory based store, if none is
+        specified. The store is where the openid module places it
+        state data; see the python-openid docs for file and SQL based
+        backends.
 
         Opid pulls success and failure redirect paths from the query
         string. In all, you can pass in values for the keys "url",
@@ -173,13 +202,29 @@ class App(object):
 
         You can set up Opid with custom redirect and
         post apps. See default_redirect_app and default_post_app
-        docstrings for details."""
+        docstrings for details.
+
+        See docstrings for verify_path and return_path for further
+        documentation."""
 
         self.realm = realm
-        self.session_key = session_key
+
+        if (session_key and session_context) or \
+           (session_key is None and session_context is None):
+            raise ValueError("opid.App expects at least session_key or session_context, but not both")
+        if session_key:
+            self.session_context = default_session_context_manager(session_key)
+        else:
+            self.session_context = session_context
+
+        if store is None:
+            import openid.store.memstore
+            self.store = openid.store.memstore.MemoryStore()
+        else:
+            self.store = store
+
         self.redirect_app = redirect_app
         self.post_app = post_app
-        self.store = store or openid.store.memstore.MemoryStore()
 
 
     def __call__(self, environ, start_response):
@@ -201,6 +246,17 @@ class App(object):
 
 
     def verify_path(self, environ, start_response):
+        """Opid expects the OpenID identity url via a query string
+        with key 'url'. You can optionally specify sucess and failure
+        redirect paths with keys 'success' and 'failure'. Opid's
+        return path will generate a redirect to the supplied success
+        path on authentication, and the failure path if it encounters
+        any problems. The default path for both is /
+
+        Finally, Opid unauthenticates before authentication
+        attempts. If you wish to disable this behavior, you can pass
+        it a query of no_unauth=1."""
+
         realm = self.realm or "%s://%s" % (environ['wsgi.url_scheme'],
                                            environ['HTTP_HOST'])
         openid_url = _enforce_single_q(environ, 'url')
@@ -211,17 +267,16 @@ class App(object):
         if no_unauth == '1':
             self.unauth(environ)
 
-        session = _get_session(environ, self.session_key)
-        session['opid.realm'] = realm
-        session['opid.openid_url'] = openid_url
-        session['opid.success_url'] = success_url
-        session['opid.failure_url'] = failure_url
-        session['opid.session'] = {}
+        with self.session_context(environ) as session:
+            session['opid.realm'] = realm
+            session['opid.openid_url'] = openid_url
+            session['opid.success_url'] = success_url
+            session['opid.failure_url'] = failure_url
+            session['opid.session'] = {}
 
-        consumer = openid.consumer.consumer.Consumer(session['opid.session'],
-                                                     self.store)
-        authreq = consumer.begin(openid_url)
-        session.save()
+            consumer = openid.consumer.consumer.Consumer(session['opid.session'],
+                                                         self.store)
+            authreq = consumer.begin(openid_url)
 
         if authreq.shouldSendRedirect():
             redirect_url = authreq.redirectURL(realm,
@@ -237,49 +292,62 @@ class App(object):
 
 
     def return_path(self, environ, start_response):
-        session = _get_session(environ, self.session_key)
-        consumer = openid.consumer.consumer.Consumer(session['opid.session'],
-                                                     self.store)
+        """After a call to verify_path, Opid instructs the OpenID
+        provider to redirect to return_path, which then examines the
+        result of the authentication and determines whether a redirect
+        to the success or failure paths are necessary.
 
-        # Consumer.complete expects a dictionary, whereas a query
-        # string represents a multidict. We flatten it here.
-        qdict = {}
-        for k,v in _parse_qsl(environ['QUERY_STRING']):
-            qdict[k] = v
+        Opid places a few pieces of information in the session:
 
-        resp = consumer.complete(qdict, self._return_to(environ))
-        environ['opid.auth_status'] = resp.status
+        opid.auth_status: contains the success or failure strings, as
+        returned by the python-openid module.
+
+        opid.identity_url: the identity returned by the OpenID provider
+
+        opid.auth_time: the time of authentication, set by Opid
+        """
+
+        with self.session_context(environ) as session:
+            consumer = openid.consumer.consumer.Consumer(session['opid.session'],
+                                                         self.store)
+
+            # Consumer.complete expects a dictionary, whereas a query
+            # string represents a multidict. We flatten it here.
+            qdict = {}
+            for k,v in _parse_qsl(environ['QUERY_STRING']):
+                qdict[k] = v
+
+            resp = consumer.complete(qdict, self._return_to(environ))
+            environ['opid.auth_status'] = resp.status
 
 
-        # fixme: we could theoretically make success and failure user
-        # definable apps. In this case, it'd be better to generalize
-        # handling of success/failure urls. Ie, we might not want them
-        # at all. Rather, when opid gets a hit at /verify, store the
-        # query string in the session. We can then pass it on to the
-        # success and failure apps, so that they can determine what to
-        # do next.
+            # fixme: we could theoretically make success and failure user
+            # definable apps. In this case, it'd be better to generalize
+            # handling of success/failure urls. Ie, we might not want them
+            # at all. Rather, when opid gets a hit at /verify, store the
+            # query string in the session. We can then pass it on to the
+            # success and failure apps, so that they can determine what to
+            # do next.
 
-        if resp.status == 'success':
-            session['opid.identity_url'] = resp.identity_url
-            session['opid.auth_time'] = time.time()
-            session.save()
+            if resp.status == 'success':
+                session['opid.identity_url'] = resp.identity_url
+                session['opid.auth_time'] = time.time()
 
-            environ['opid.redirect_url'] = session['opid.success_url']
-            return self.redirect_app(environ, start_response)
-        else:
-            environ['opid.redirect_url'] = session['opid.failure_url']
-            return self.redirect_app(environ, start_response)
+                environ['opid.redirect_url'] = session['opid.success_url']
+                return self.redirect_app(environ, start_response)
+            else:
+                environ['opid.redirect_url'] = session['opid.failure_url']
+                return self.redirect_app(environ, start_response)
 
 
     def unauth(self, environ):
         """Removes opid session state, thereby unauthenticating user."""
 
-        session = _get_session(environ, self.session_key)
-        for k in ['opid.realm', 'opid.openid_url', 'opid.success_url', 'opid.failure_url',
-                  'opid.session', 'opid.identity_url', 'opid.auth_time', 'opid.auth_status']:
-            if k in session:
-                del session[k]
-        session.save()
+        with self.session_context(environ) as session:
+            for k in ['opid.realm', 'opid.openid_url', 'opid.success_url', 'opid.failure_url',
+                      'opid.session', 'opid.identity_url', 'opid.auth_time', 'opid.auth_status']:
+                if k in session:
+                    del session[k]
 
 
     def unauth_app(self, return_url='/'):
@@ -300,8 +368,3 @@ class App(object):
             return self.redirect_app(environ, start_response)
 
         return wsgi
-
-
-# alias a couple stores for convenience
-MemStore = openid.store.memstore.MemoryStore
-FileStore = openid.store.filestore.FileOpenIDStore
